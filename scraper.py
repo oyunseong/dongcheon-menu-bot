@@ -192,6 +192,12 @@ def fetch_posts():
             "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Referer": f"https://pf.kakao.com/{CHANNEL_ID}/posts",
+        "Origin": "https://pf.kakao.com",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
     }
 
     def do_request():
