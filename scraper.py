@@ -202,6 +202,10 @@ def fetch_posts():
 
     def do_request():
         resp = requests.get(POSTS_API_URL, headers=headers, timeout=REQUEST_TIMEOUT)
+        # TEMP DEBUG: GitHub Actions에서 빈 {} 응답이 오는 원인 진단용. 원인
+        # 파악 후 제거할 것.
+        print(f"[디버그] status={resp.status_code} headers={dict(resp.headers)}")
+        print(f"[디버그] body(500자)={resp.text[:500]!r}")
         resp.raise_for_status()
         try:
             return resp.json()
