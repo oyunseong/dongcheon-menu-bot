@@ -1,0 +1,72 @@
+name: 동천한식뷔페 메뉴 -> Teams 전송
+
+on:
+  schedule:
+    # UTC 기준 (KST = UTC+9)
+    # 1) 10:45 KST - 중식 메뉴 체크 (관찰된 게시 시각 10:29~10:38, 점심 12시 전 여유 확보)
+    - cron: "45 1 * * *"
+    # 2) 17:20 KST - 석식 메뉴 체크 (관찰된 게시 시각 17:04~17:12, 퇴근 18시 전 여유 확보)
+    - cron: "20 8 * * *"
+
+  # 수동 실행: Actions 탭 -> Run workflow 버튼
+  # force=true 로 실행하면 dedupe 무시하고 최신 글을 즉시 강제 재전송
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "최신 게시글을 dedupe 무시하고 즉시 재전송할지 여부"
+        type: boolean
+        default: false
+
+  # 외부(API 호출)에서 즉시 트리거하고 싶을 때 사용.
+  repository_dispatch:
+    types: [menu-check]
+
+permissions:
+  contents: write  # state.json 커밋을 위해 필요
+
+# 스케줄/수동/API 트리거가 겹쳐도 동시에 두 잡이 state.json을 건드리지
+# 않도록 직렬화. 이미 실행 중이면 새 트리거는 대기열에 쌓인다(취소하지 않음).
+concurrency:
+  group: menu-notify
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 스크래핑 + Teams 전송
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          FORCE_RESEND: ${{ (github.event.inputs.force == 'true') && '1' || '0' }}
+        run: python scraper.py
+
+      - name: state.json 변경사항 커밋 및 푸시 (충돌 시 재시도)
+        if: always()  # 이전 스텝이 3번째 글 전송 중 실패했어도, 이미 보낸 1/2번 글의
+                       # dedupe 기록은 반드시 커밋되어야 다음 실행에서 중복 전송을 막는다.
+        run: |
+          git config user.name "menu-bot"
+          git config user.email "menu-bot@users.noreply.github.com"
+          git add state.json
+          if git diff --staged --quiet; then
+            echo "변경 없음, 커밋 스킵"
+            exit 0
+          fi
+          git commit -m "update state"
+          for i in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "push 실패, rebase 후 재시도 ($i/3)"
+            git pull --rebase
+          done
+          echo "state.json push 최종 실패"
+          exit 1
