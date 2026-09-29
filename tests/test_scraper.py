@@ -10,10 +10,6 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("TEAMS_WEBHOOK_URL", "https://example.invalid/webhook")
-# 원격 state 동기화(GitHub Contents API)는 명시적으로 켜는 테스트를 제외하고
-# 기본적으로 꺼져 있어야 한다 - 개발 환경에 우연히 GITHUB_TOKEN이 있어도
-# 다른 테스트에 영향 주지 않도록 여기서 확실히 지운다.
-os.environ.pop("GITHUB_TOKEN", None)
 
 import scraper  # noqa: E402
 
@@ -429,90 +425,6 @@ def test_current_meal_label_am_pm(monkeypatch):
     assert scraper.current_meal_label() == "석식(저녁)"
 
 
-def make_github_get_response(status_code, sha=None):
-    resp = MagicMock()
-    resp.status_code = status_code
-    if status_code == 200:
-        resp.json.return_value = {"sha": sha}
-    resp.raise_for_status.side_effect = (
-        requests.HTTPError(response=resp) if status_code >= 400 else None
-    )
-    return resp
-
-
-def make_github_put_response(status_code):
-    resp = MagicMock()
-    resp.status_code = status_code
-    resp.raise_for_status.side_effect = (
-        requests.HTTPError(response=resp) if status_code >= 400 else None
-    )
-    return resp
-
-
-def test_remote_sync_disabled_without_token(monkeypatch):
-    monkeypatch.setattr(scraper, "GITHUB_TOKEN", None)
-    monkeypatch.setattr(scraper, "GITHUB_REPOSITORY", "owner/repo")
-    calls = []
-    monkeypatch.setattr(scraper.requests, "get", MagicMock(side_effect=lambda *a, **k: calls.append(1)))
-
-    assert scraper._remote_sync_enabled() is False
-    # persist_state가 로컬 저장만 하고 원격 API는 아예 호출하지 않아야 함
-    scraper.STATE_FILE = "/tmp/menu-bot-test-state.json"
-    scraper.persist_state({"sent_hashes": [1]})
-    assert calls == []
-
-
-def test_sync_state_retries_transient_network_error_on_put(monkeypatch):
-    """409(충돌)가 아니라 타임아웃/연결 오류 같은 일시적 오류는 with_retry가
-    같은 시도 안에서 재시도해야 한다 (5xx/네트워크 오류에 재시도가 없던 결함 수정)."""
-    monkeypatch.setattr(scraper, "GITHUB_TOKEN", "fake-token")
-    monkeypatch.setattr(scraper, "GITHUB_REPOSITORY", "owner/repo")
-    monkeypatch.setattr(scraper.time, "sleep", MagicMock())
-
-    monkeypatch.setattr(
-        scraper.requests, "get", MagicMock(return_value=make_github_get_response(200, sha="sha-1"))
-    )
-    put_mock = MagicMock(
-        side_effect=[
-            requests.exceptions.ConnectionError("일시적 네트워크 오류"),
-            make_github_put_response(200),
-        ]
-    )
-    monkeypatch.setattr(scraper.requests, "put", put_mock)
-
-    scraper.sync_state_to_github({"sent_hashes": [1]})  # 예외 없이 끝나야 함
-    assert put_mock.call_count == 2  # with_retry가 같은 CAS 시도 안에서 재시도했음
-
-
-def test_sync_state_retries_on_conflict_then_succeeds(monkeypatch):
-    monkeypatch.setattr(scraper, "GITHUB_TOKEN", "fake-token")
-    monkeypatch.setattr(scraper, "GITHUB_REPOSITORY", "owner/repo")
-    monkeypatch.setattr(scraper.time, "sleep", MagicMock())
-
-    get_calls = [make_github_get_response(200, sha="sha-1"), make_github_get_response(200, sha="sha-2")]
-    put_calls = [make_github_put_response(409), make_github_put_response(200)]
-    monkeypatch.setattr(scraper.requests, "get", MagicMock(side_effect=get_calls))
-    monkeypatch.setattr(scraper.requests, "put", MagicMock(side_effect=put_calls))
-
-    scraper.sync_state_to_github({"sent_hashes": [1, 2]})  # 예외 없이 끝나야 함
-
-
-def test_sync_state_raises_after_exhausting_retries(monkeypatch):
-    monkeypatch.setattr(scraper, "GITHUB_TOKEN", "fake-token")
-    monkeypatch.setattr(scraper, "GITHUB_REPOSITORY", "owner/repo")
-    monkeypatch.setattr(scraper.time, "sleep", MagicMock())
-
-    monkeypatch.setattr(
-        scraper.requests, "get", MagicMock(return_value=make_github_get_response(200, sha="sha-1"))
-    )
-    monkeypatch.setattr(
-        scraper.requests, "put", MagicMock(return_value=make_github_put_response(409))
-    )
-
-    with pytest.raises(RuntimeError):
-        scraper.sync_state_to_github({"sent_hashes": [1]})
-
-
 def test_check_and_send_alerts_when_persist_fails(monkeypatch, tmp_path):
     resp = make_response(json_data={"items": [SAMPLE_ITEM]})
     monkeypatch.setattr(scraper.requests, "get", MagicMock(return_value=resp))
@@ -521,9 +433,9 @@ def test_check_and_send_alerts_when_persist_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(scraper, "send_to_teams", lambda post: None)
 
     def boom(state):
-        raise RuntimeError("원격 저장 실패")
+        raise OSError("디스크 쓰기 실패")
 
-    monkeypatch.setattr(scraper, "persist_state", boom)
+    monkeypatch.setattr(scraper, "save_state", boom)
     alerts = []
     monkeypatch.setattr(scraper, "send_persist_failure_alert", lambda: alerts.append(1))
 

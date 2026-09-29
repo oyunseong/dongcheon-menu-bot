@@ -14,17 +14,14 @@
      밀려나는 방식으로 관리하면 밀려난 순간 "새 글"로 재판정되어 주기적으로
      중복 전송된다. 단, 어떤 글이 보내진 뒤에 카카오 쪽에서 고정 상태가
      바뀌는 것까지는 추적하지 않는다 - 극히 드문 경우라 감수한다.)
-4. 전송 후 state.json을 갱신한다. GitHub Actions에서는 로컬 파일 저장과
-   별도로, GitHub Contents API로 저장소의 state.json을 직접 갱신한다
-   (git commit/push 대신 sha 기반 compare-and-swap - 로컬 git 상태나 rebase
-   충돌 같은 불투명한 실패 모드가 없고, 실패하면 그 자리에서 Teams로 알린다).
+4. 전송 후 state.json을 갱신한다. 저장에 실패하면 그 자리에서 Teams로 알린다.
 5. 새 글이 없으면 같은 실행 안에서 NO_MENU_RECHECK_WAIT_SEC만큼 기다렸다가
    한 번 더 확인한다. 그래도 없으면 Teams에 안내 메시지를 보낸다.
 6. 카카오 API 자체가 실패하면(다운, 스키마 변경 등) Teams에 실패 알림을 보내고
-   Actions 잡도 실패 처리한다. 반면 새 글 중 일부만 Teams 전송에 실패하면
+   프로세스도 실패(exit 1) 처리한다. 반면 새 글 중 일부만 Teams 전송에 실패하면
    (예: 웹훅 일시 장애) 그 글만 건너뛰고 나머지 새 글은 계속 보낸다 - 실패한
    글 하나가 뒤에 있는 다른 새 글까지 영영 막으면 안 되기 때문이다. 이 경우
-   잡은 성공 처리되고, 실패한 글은 별도 경고와 함께 다음 실행에서 재시도된다.
+   실행은 성공 처리되고, 실패한 글은 별도 경고와 함께 다음 실행에서 재시도된다.
    두 경우 모두 침묵 실패는 없다.
 """
 
@@ -32,7 +29,6 @@ import os
 import sys
 import json
 import time
-import base64
 from datetime import datetime, timezone, timedelta
 import requests
 
@@ -40,8 +36,7 @@ import requests
 def load_dotenv(path=".env"):
     """.env 파일이 있으면 KEY=VALUE 줄을 환경변수로 로드한다 (이미 설정된 값은 덮어쓰지 않음).
 
-    로컬(launchd)에서는 TEAMS_WEBHOOK_URL 등을 셸 프로필 없이 넘기기 위해 쓴다.
-    GitHub Actions에서는 이 파일이 없으므로 아무 영향이 없다.
+    launchd는 셸 프로필을 읽지 않으므로 TEAMS_WEBHOOK_URL 등을 이 파일로 넘긴다.
     """
     if not os.path.exists(path):
         return
@@ -76,15 +71,6 @@ FORCE_RESEND = os.environ.get("FORCE_RESEND") == "1"  # 수동 실행 시 최신
 # (예: 외부에서 조용히 상태만 확인하고 싶을 때 "0"으로 끌 수 있게 남겨둔 옵션)
 ALERT_IF_EMPTY = os.environ.get("ALERT_IF_EMPTY", "1") == "1"
 TEAMS_WEBHOOK_URL = os.environ.get("TEAMS_WEBHOOK_URL")
-
-# GitHub Contents API로 state.json을 원격에 직접 반영하기 위한 값들.
-# GITHUB_REPOSITORY는 Actions 러너가 기본 제공하고, GITHUB_TOKEN은 워크플로우
-# 에서 secrets.GITHUB_TOKEN을 명시적으로 넘겨줘야 한다. 둘 다 없으면(로컬 실행)
-# 원격 동기화는 건너뛰고 로컬 파일 저장만 한다.
-GITHUB_API_BASE = "https://api.github.com"
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")
-MAX_REMOTE_SYNC_RETRIES = 5
 
 
 def fail_fast(message):
@@ -133,72 +119,6 @@ def save_state(state):
     state["sent_hashes"] = state["sent_hashes"][-200:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-def _remote_sync_enabled():
-    return bool(GITHUB_TOKEN and GITHUB_REPOSITORY)
-
-
-def sync_state_to_github(state):
-    """state.json을 GitHub Contents API로 저장소에 직접 커밋한다.
-
-    git commit/push 대신 sha 기반 compare-and-swap을 쓴다: 현재 파일의 sha를
-    같이 보내고, 그사이 다른 실행이 먼저 갱신해서 sha가 안 맞으면(409) 최신
-    sha를 다시 받아와 재시도한다. GET/PUT 각각은 with_retry로 일시적 네트워크
-    오류/5xx도 재시도하고, 409(충돌)만 이 함수의 바깥 루프에서 별도로 재시도
-    한다. 로컬 git 상태/rebase 충돌 같은 불투명한 실패 모드가 없고, 실패 시
-    예외를 던져서 호출부가 Teams로 알릴 수 있다.
-    """
-    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPOSITORY}/contents/{STATE_FILE}"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-    content_b64 = base64.b64encode(
-        json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
-    ).decode("ascii")
-
-    def get_current_sha():
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 404:
-            return None  # 파일이 아직 없으면 새로 생성
-        resp.raise_for_status()
-        return resp.json()["sha"]
-
-    last_err = None
-    for attempt in range(1, MAX_REMOTE_SYNC_RETRIES + 1):
-        current_sha = with_retry(get_current_sha, "state.json sha 조회")
-
-        put_body = {"message": "메뉴 봇: state.json 갱신 [skip ci]", "content": content_b64}
-        if current_sha:
-            put_body["sha"] = current_sha
-
-        def do_put():
-            resp = requests.put(
-                url, headers=headers, json=put_body, timeout=REQUEST_TIMEOUT
-            )
-            resp.raise_for_status()
-            return resp
-
-        try:
-            with_retry(do_put, "state.json 원격 저장")
-            return
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else None
-            if status != 409:
-                raise  # 권한/스키마 문제 등은 재시도 무의미, 즉시 전파
-            last_err = f"state.json 충돌(동시 갱신), 최신 sha로 재시도 ({attempt}/{MAX_REMOTE_SYNC_RETRIES})"
-            print(f"[재시도] {last_err}")
-            time.sleep(attempt)
-
-    raise RuntimeError(f"state.json 원격 저장 최종 실패: {last_err}")
-
-
-def persist_state(state):
-    """로컬 파일 저장 + (GitHub Actions라면) 원격 저장소에 직접 반영."""
-    save_state(state)
-    if _remote_sync_enabled():
-        sync_state_to_github(state)
 
 
 def fetch_posts():
@@ -349,9 +269,9 @@ def send_persist_failure_alert():
         "themeColor": "D70000",
         "title": "⚠️ 전송 기록 저장에 실패했어요",
         "text": (
-            "메뉴는 정상적으로 보냈지만, 중복 방지 기록(state.json)을 저장소에 "
-            "반영하는 데 실패했어요.\n\n다음 확인 때 같은 메뉴가 한 번 더 "
-            "전송될 수 있어요. Actions 로그를 확인해주세요."
+            "메뉴는 정상적으로 보냈지만, 중복 방지 기록(state.json)을 "
+            "저장하는 데 실패했어요.\n\n다음 확인 때 같은 메뉴가 한 번 더 "
+            "전송될 수 있어요. launchd.log를 확인해주세요."
         ),
     }
     try:
@@ -363,7 +283,7 @@ def send_persist_failure_alert():
 def send_post_failure_alert(failed_posts):
     """일부 새 글이 Teams 전송에 실패했을 때 알린다.
 
-    스크립트 자체는 계속 진행하고 Actions 잡도 실패 처리하지 않는다(뒤에 있는
+    스크립트 자체는 계속 진행하고 실패(exit 1) 처리하지 않는다(뒤에 있는
     다른 새 글까지 막지 않기 위함) - 대신 이 알림으로 "조용히 놓친 글"이
     생기지 않게 한다. 실패한 글은 다음 실행에서 자동으로 재시도된다.
     """
@@ -389,7 +309,7 @@ def send_post_failure_alert(failed_posts):
 def send_failure_alert(error):
     """스크립트가 실패했을 때(카카오 API 실패 등) Teams에도 알린다 (침묵 실패 방지).
 
-    이 함수는 Actions 잡을 실패 처리하는 치명적 오류 경로에서만 쓴다. 개별 글
+    이 함수는 실행을 실패 처리하는 치명적 오류 경로에서만 쓴다. 개별 글
     전송 실패처럼 회복 가능한 오류는 send_post_failure_alert를 쓴다.
     """
     payload = {
@@ -452,15 +372,15 @@ def check_and_send(state):
             # 있는 다른 새 글까지 영영 못 보내면 안 되므로, 여기서 멈추지 않고
             # 다음 글로 넘어간다. 실패한 글은 기록에 남기지 않아 다음 실행에서
             # 다시 시도된다. (네트워크/HTTP 오류가 아닌 버그성 예외는 여기서
-            # 잡지 않고 그대로 전파시켜 잡을 실패 처리한다 - 매 실행마다 같은
+            # 잡지 않고 그대로 전파시켜 실행을 실패 처리한다 - 매 실행마다 같은
             # 버그로 조용히 재시도만 반복되는 것을 막기 위함.)
             send_failed_posts.append(post)
             print(f"[경고] 전송 실패: {post['title']} ({e})", file=sys.stderr)
             continue
         _mark_sent(state, post)
         try:
-            persist_state(state)  # 여러 건 중 중간에 실패해도 이미 보낸 건 기록되도록 매건 저장
-        except (RuntimeError, OSError, requests.RequestException) as e:
+            save_state(state)  # 여러 건 중 중간에 실패해도 이미 보낸 건 기록되도록 매건 저장
+        except OSError as e:
             persist_failed = True
             print(f"[경고] 전송 기록 저장 실패: {e}", file=sys.stderr)
         time.sleep(1)
@@ -476,8 +396,8 @@ def check_and_send(state):
 def main():
     if not TEAMS_WEBHOOK_URL:
         fail_fast(
-            "TEAMS_WEBHOOK_URL 환경변수(GitHub Secret)가 설정되지 않았습니다. "
-            "저장소 Settings > Secrets and variables > Actions 에서 등록하세요."
+            "TEAMS_WEBHOOK_URL이 설정되지 않았습니다. "
+            ".env 파일에 TEAMS_WEBHOOK_URL=... 을 추가하세요."
         )
 
     state = load_state()
@@ -497,7 +417,7 @@ def main():
             send_to_teams(latest)
         except requests.RequestException as e:
             # 자동 스케줄 경로(check_and_send)와 동일하게, 전송 실패가 곧바로
-            # 잡 실패로 이어지지 않게 한다 - "메뉴 확인 중 오류"라는 오해의
+            # 실행 실패로 이어지지 않게 한다 - "메뉴 확인 중 오류"라는 오해의
             # 소지가 있는 메시지 대신 전용 알림을 보낸다.
             print(f"[경고] 강제 전송 실패: {e}", file=sys.stderr)
             send_post_failure_alert([latest])
@@ -506,8 +426,8 @@ def main():
         if latest["id"] not in sent_ids:
             _mark_sent(state, latest)
             try:
-                persist_state(state)
-            except (RuntimeError, OSError, requests.RequestException) as e:
+                save_state(state)
+            except OSError as e:
                 print(f"[경고] 전송 기록 저장 실패: {e}", file=sys.stderr)
                 send_persist_failure_alert()
         return
