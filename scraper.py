@@ -36,6 +36,28 @@ import base64
 from datetime import datetime, timezone, timedelta
 import requests
 
+
+def load_dotenv(path=".env"):
+    """.env 파일이 있으면 KEY=VALUE 줄을 환경변수로 로드한다 (이미 설정된 값은 덮어쓰지 않음).
+
+    로컬(launchd)에서는 TEAMS_WEBHOOK_URL 등을 셸 프로필 없이 넘기기 위해 쓴다.
+    GitHub Actions에서는 이 파일이 없으므로 아무 영향이 없다.
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+
+
+load_dotenv()
+
 # 다른 카카오톡 채널에 재사용하려면 KAKAO_CHANNEL_ID 환경변수만 바꾸면 된다.
 CHANNEL_ID = os.environ.get("KAKAO_CHANNEL_ID", "_xgUVZn")
 POSTS_API_URL = (
